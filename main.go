@@ -1,12 +1,11 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
-	"strconv"
 	"time"
 
-	"github.com/go-audio/audio"
 	"github.com/go-audio/wav"
 	"github.com/gordonklaus/portaudio"
 
@@ -19,8 +18,8 @@ import (
 )
 
 const (
-	// ServerAddr = "localhost:8081"
-	ServerAddr = "speccy49home.ddns.net:8081"
+	ServerAddr = "localhost:8081"
+	// ServerAddr = "speccy49home.ddns.net:8081"
 )
 
 const SIGNATURE = 0x4C2AE6CC
@@ -41,6 +40,8 @@ type Packet struct {
 	FrameLength uint32
 	Frame       []byte
 }
+
+
 
 
 func (p *Packet) Encode() []byte {
@@ -76,14 +77,103 @@ func Decode(data []byte) Packet {
 }
 
 
-func main() {
 
-	StreamId, err:= strconv.Atoi(os.Args[1])
-	if err != nil {
-		panic("AAAAAA")
+func main() {
+	filePath := flag.String("file", "", "Path to the audio file")
+	streamID := flag.Int("streamid", -1, "Stream ID (required)")
+	flag.Parse()
+
+	if *streamID == -1 {
+		log.Fatal("Error: -streamid flag is required")
 	}
 
-	err = portaudio.Initialize()
+	if *filePath != "" {
+		processFile(*filePath, *streamID)
+	} else {
+		recordFromMic(*streamID)
+	}
+}
+
+func processFile(filePath string, streamID int) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Fatalf("Failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	decoder := wav.NewDecoder(file)
+	audioBuf, err := decoder.FullPCMBuffer()
+	if err != nil {
+		log.Fatalf("Failed to decode WAV file: %v", err)
+	}
+
+	sampleRate := decoder.SampleRate
+	opusEncoder, err := opus.NewEncoder(int(sampleRate), 1, opus.AppAudio)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", ServerAddr)
+	if err != nil {
+		log.Fatalf("Failed to resolve UDP address: %v", err)
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		log.Fatalf("Failed to connect to UDP server: %v", err)
+	}
+	defer conn.Close()
+
+	var frameNumber uint32 = 0
+	frameSize := 960 // Adjust based on your encoding settings
+
+	for i := 0; i < len(audioBuf.Data); i += frameSize {
+		
+		
+		end := i + frameSize
+		if end > len(audioBuf.Data) {
+			end = len(audioBuf.Data)
+		}
+		frame := audioBuf.Data[i:end]
+		encoded := make([]byte, 1024)
+
+		n, err := opusEncoder.Encode(int16Slice(frame), encoded)
+		if err != nil {
+			log.Printf("Could not encode sound with OPUS: %v", err)
+			continue
+		}
+		fmt.Println(n)
+
+		packet := Packet{
+			Signature:   SIGNATURE,
+			StreamID:    uint32(streamID),
+			MessageType: AUDIO,
+			FrameNumber: frameNumber,
+			Timestamp:   uint64(time.Now().UnixMicro()),
+			SampleRate:  uint32(sampleRate),
+			FrameLength: uint32(n),
+			Frame:       encoded[:n],
+		}
+
+		_, err = conn.Write(packet.Encode())
+		if err != nil {
+			log.Printf("Failed to send packet: %v", err)
+		}
+
+		frameNumber++
+	}
+}
+
+
+func int16Slice(data []int) []int16 {
+	out := make([]int16, len(data))
+	for i, d := range data {
+		out[i] = int16(d)
+	}
+	return out
+}
+
+func recordFromMic(streamID int) {
+	err := portaudio.Initialize()
 	if err != nil {
 		log.Fatalf("Failed to initialize PortAudio: %v", err)
 	}
@@ -109,45 +199,37 @@ func main() {
 	}
 	fmt.Println("Recording...")
 
-	start := time.Now()
-	var i uint32 = 0
-
-	outFile, err := os.Create("output.wav")
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer outFile.Close()
-
-	encoder := wav.NewEncoder(outFile, sampleRate, 16, 1, 1)
-	buf := &audio.IntBuffer{Data: make([]int, 0, sampleRate), Format: &audio.Format{SampleRate: sampleRate, NumChannels: 1}}
-
 	addr, err := net.ResolveUDPAddr("udp", ServerAddr)
-	log.Printf("UDP: %v", err)
+	if err != nil {
+		log.Fatalf("Failed to resolve UDP address: %v", err)
+	}
 	conn, err := net.DialUDP("udp", nil, addr)
-	log.Printf("UDP: %v", err)
+	if err != nil {
+		log.Fatalf("Failed to connect to UDP server: %v", err)
+	}
 	defer conn.Close()
 
-	for time.Since(start) < 60*time.Second {
+	start := time.Now()
+	var frameNumber uint32 = 0
+
+	for time.Since(start) < 10*60*time.Second {
 		if err := stream.Read(); err != nil {
 			log.Fatalf("Failed to read from stream: %v", err)
 		}
 
-		for _, sample := range in {
-			buf.Data = append(buf.Data, int(sample))
-		}
-
-		// Copy data to buffer
 		encoded := make([]byte, 1024)
 		n, err := opusEncoder.Encode(in, encoded)
 		if err != nil {
-			log.Printf("Could not encode sound withj OPUS: %s", err)
+			log.Printf("Could not encode sound with OPUS: %v", err)
+			continue
 		}
+
 		packet := Packet{
 			Signature:   SIGNATURE,
-			StreamID:    uint32(StreamId),
+			StreamID:    uint32(streamID),
 			MessageType: AUDIO,
-			FrameNumber: i,
-			Timestamp:   uint64(time.Now().Unix()),
+			FrameNumber: frameNumber,
+			Timestamp:   uint64(time.Now().UnixNano()),
 			SampleRate:  uint32(sampleRate),
 			FrameLength: uint32(n),
 			Frame:       encoded[:n],
@@ -155,10 +237,10 @@ func main() {
 
 		_, err = conn.Write(packet.Encode())
 		if err != nil {
-			log.Println(err)
+			log.Printf("Failed to send packet: %v", err)
 		}
-		i += 1
 
+		frameNumber++
 	}
 
 	err = stream.Stop()
@@ -166,15 +248,5 @@ func main() {
 		log.Fatalf("Failed to stop audio stream: %v", err)
 	}
 
-	if err := encoder.Write(buf); err != nil {
-		log.Fatalf("Failed to write data to WAV file: %v", err)
-	}
-
-	// Finalize and close encoder
-	if err := encoder.Close(); err != nil {
-		log.Fatalf("Failed to close WAV encoder: %v", err)
-	}
-
-	log.Println("Recording saved to output.wav")
-
+	log.Println("Recording finished.")
 }
